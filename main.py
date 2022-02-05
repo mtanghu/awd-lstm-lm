@@ -77,7 +77,7 @@ parser.add_argument("-asgd", "--asgd", required=False,
 args = parser.parse_args()
 args.tied = True
 
-if args.server is 'ford':
+if args.server == 'ford':
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     print("\nThis experiment runs on gpu {}...\n".format(args.gpu))
 
