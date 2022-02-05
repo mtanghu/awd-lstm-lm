@@ -12,6 +12,8 @@ from asgd import ASGD
 from model_save import model_load, model_save, model_state_save
 from sys_config import BASE_DIR, CKPT_DIR, CACHE_DIR
 
+import dni
+
 from utils import batchify, get_batch, repackage_hidden
 
 parser = argparse.ArgumentParser(description='PyTorch PennTreeBank RNN/LSTM Language Model')
@@ -23,17 +25,19 @@ parser.add_argument('--emsize', type=int, default=400,
                     help='size of word embeddings')
 parser.add_argument('--nhid', type=int, default=1150,
                     help='number of hidden units per layer')
-parser.add_argument('--nlayers', type=int, default=3,
+parser.add_argument('--nlayers', type=int, default=1,
                     help='number of layers')
 parser.add_argument('--lr', type=float, default=30,
                     help='initial learning rate')
-parser.add_argument('--clip', type=float, default=0.25,
+parser.add_argument('--clip', type=float, default=5,
                     help='gradient clipping')
 parser.add_argument('--epochs', type=int, default=800,
                     help='upper epoch limit')
 parser.add_argument('--batch_size', type=int, default=32, metavar='N',
                     help='batch size')
-parser.add_argument('--bptt', type=int, default=70,
+parser.add_argument('--tbptt', type=int, default=20,
+                    help='when to truncate sequence')
+parser.add_argument('--seq-length', type=int, default=500,
                     help='sequence length')
 parser.add_argument('--dropout', type=float, default=0.4,
                     help='dropout applied to layers (0 = no dropout)')
@@ -68,18 +72,14 @@ parser.add_argument('--optimizer', type=str, default='sgd',
                     help='optimizer to use (sgd, adam)')
 parser.add_argument('--when', nargs="+", type=int, default=[-1],
                     help='When (which epochs) to divide the learning rate by 10 - accepts multiple')
-parser.add_argument("-g", "--gpu", required=False,
-                    default='1', help="gpu on which this experiment runs")
-parser.add_argument("-server", "--server", required=False,
-                    default='ford', help="server on which this experiment runs")
-parser.add_argument("-asgd", "--asgd", required=False,
-                    default='True', help="server on which this experiment runs")
+parser.add_argument('-g', '--gpu', required=False,
+                    default='0', help='gpu on which this experiment runs')
+parser.add_argument('-asgd', '--asgd', required=False,
+                    default='True', help='use averaged SGD')
+parser.add_argument('--tied', action='store_true', help='use decoupled neural interfaces')
+parser.add_argument('--dni', action='store_true', help="use decoupled neural interfaces")
 args = parser.parse_args()
-args.tied = True
 
-if args.server == 'ford':
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
-    print("\nThis experiment runs on gpu {}...\n".format(args.gpu))
 
 ###############################################################################
 print("torch:", torch.__version__)
@@ -141,6 +141,8 @@ ntokens = len(corpus.dictionary)
 model = model.AWD(args.model, ntokens, args.emsize, args.nhid,
                        args.nlayers, args.dropout, args.dropouth,
                        args.dropouti, args.dropoute, args.wdrop, args.tied)
+if args.dni:
+    synth = dni.Synthesizer(size = args.nhid, is_lstm = args.model=="LSTM", aux = False, allow_backwarding = True, use_improvement = True).cuda()
 
 ###
 if args.resume:
@@ -193,7 +195,7 @@ def evaluate(data_source, batch_size=10):
     total_loss = 0
     ntokens = len(corpus.dictionary)
     hidden = model.init_hidden(batch_size)
-    for i in range(0, data_source.size(0) - 1, args.bptt):
+    for i in range(0, data_source.size(0) - 1, args.seq_length):
         data, targets = get_batch(data_source, i, args, evaluation=True)
         output, hidden = model(data, hidden)
         total_loss += len(data) * criterion(model.decoder.weight, model.decoder.bias, output, targets).data
@@ -210,45 +212,55 @@ def train():
     hidden = model.init_hidden(args.batch_size)
     batch, i = 0, 0
     while i < train_data.size(0) - 1 - 1:
-        bptt = args.bptt if np.random.random() < 0.95 else args.bptt / 2.
-        # Prevent excessively small or negative sequence lengths
-        seq_len = max(5, int(np.random.normal(bptt, 5)))
-        # There's a very small chance that it could select a very long sequence length resulting in OOM
-        # seq_len = min(seq_len, args.bptt + 10)
-
-        lr2 = optimizer.param_groups[0]['lr']
-        optimizer.param_groups[0]['lr'] = lr2 * seq_len / args.bptt
+        tbptt = args.tbptt
+        seq_len = args.seq_length
+        
         model.train()
         data, targets = get_batch(train_data, i, args, seq_len=seq_len)
-
+        
         # Starting each batch, we detach the hidden state from how it was previously produced.
         # If we didn't, the model would try backpropagating all the way to start of the dataset.
         hidden = repackage_hidden(hidden)
         optimizer.zero_grad()
+        
+        batch_losses = 0
+        for data_split, targets_split in zip(torch.split(data, tbptt, dim = 0), torch.split(targets, tbptt, dim = 0)):
+            output, hidden, rnn_hs, dropped_rnn_hs = model(data_split, hidden, return_h=True)
+            raw_loss = criterion(model.decoder.weight, model.decoder.bias, output, targets_split)
 
-        output, hidden, rnn_hs, dropped_rnn_hs = model(data, hidden, return_h=True)
-        raw_loss = criterion(model.decoder.weight, model.decoder.bias, output, targets)
+            loss = raw_loss
+            # Activation Regularization
+            if args.alpha: loss = loss + sum(
+                args.alpha * dropped_rnn_h.pow(2).mean() for dropped_rnn_h in dropped_rnn_hs[-1:])
+            # Temporal Activation Regularization (slowness)
+            if args.beta: loss = loss + sum(args.beta * (rnn_h[1:] - rnn_h[:-1]).pow(2).mean() for rnn_h in rnn_hs[-1:])
+            loss.backward(retain_graph = True)
+            
+            if args.dni:
+                hidden = [synth.backward_synthetic(hidden[0])]
+            else:
+                # Truncate the BPTT
+                hidden = repackage_hidden(hidden)
+            
+            batch_losses += raw_loss.data
 
-        loss = raw_loss
-        # Activation Regularization
-        if args.alpha: loss = loss + sum(
-            args.alpha * dropped_rnn_h.pow(2).mean() for dropped_rnn_h in dropped_rnn_hs[-1:])
-        # Temporal Activation Regularization (slowness)
-        if args.beta: loss = loss + sum(args.beta * (rnn_h[1:] - rnn_h[:-1]).pow(2).mean() for rnn_h in rnn_hs[-1:])
-        loss.backward()
-
+            
+        total_loss += batch_losses / math.ceil(seq_len / tbptt)
+            
         # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
         if args.clip: torch.nn.utils.clip_grad_norm_(params, args.clip)
-        optimizer.step()
+            
+        if args.dni:
+            synth.step()
 
-        total_loss += raw_loss.data
-        optimizer.param_groups[0]['lr'] = lr2
+        optimizer.step()
+        
         if batch % args.log_interval == 0 and batch > 0:
             cur_loss = total_loss / args.log_interval
             elapsed = time.time() - start_time
             print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:05.5f} | ms/batch {:5.2f} | '
                   'loss {:5.2f} | ppl {:8.2f} | bpc {:8.3f}'.format(
-                epoch, batch, len(train_data) // args.bptt, optimizer.param_groups[0]['lr'],
+                epoch, batch, len(train_data) // args.seq_length, optimizer.param_groups[0]['lr'],
                               elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss), cur_loss / math.log(2)))
             total_loss = 0
             start_time = time.time()
