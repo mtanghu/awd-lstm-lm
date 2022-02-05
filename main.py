@@ -288,17 +288,17 @@ try:
         # memory debug
         print('Memory before train')
         if args.cuda:
-            print(torch.cuda.get_device_properties(device).total_memory)
-            print(torch.cuda.memory_cached(device))
-            print(torch.cuda.memory_allocated(device))
+            print('Total memory:', torch.cuda.get_device_properties(device).total_memory)
+            print('Reserved (cached) memory:', torch.cuda.memory_reserved(device))
+            print('Allocated memory:', torch.cuda.memory_allocated(device))
         ####################################
         train()
         ####################################
         print('Memory after train')
         if args.cuda:
-            print(torch.cuda.get_device_properties(device).total_memory)
-            print(torch.cuda.memory_cached(device))
-            print(torch.cuda.memory_allocated(device))
+            print('Total memory:', torch.cuda.get_device_properties(device).total_memory)
+            print('Reserved (cached) memory:', torch.cuda.memory_reserved(device))
+            print('Allocated memory:', torch.cuda.memory_allocated(device))
         ####################################
         if args.cuda:
             try:
